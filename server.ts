@@ -1,31 +1,29 @@
-import { createServer } from "http";
-import { fetch } from "undici";
-import {
-  Server as McpServer,
-  Tool,
-} from "@modelcontextprotocol/sdk/server/index.js";
-import {
-  StreamableHttpServerTransport,
-} from "@modelcontextprotocol/sdk/server/streamable-http.js";
+import express from "express";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-// 1) Define the weather tool
-const getWeather: Tool = {
-  name: "get_weather",
-  description: "Get current temperature (°C) and a short description for a city.",
-  inputSchema: {
-    type: "object",
-    properties: { city: { type: "string", description: "City name" } },
-    required: ["city"],
+// 1) MCP server with one tool
+const mcp = new McpServer(
+  { name: "weather-mcp", version: "1.0.0" },
+  { capabilities: { logging: {} } }
+);
+
+// Register `get_weather(city)`
+mcp.registerTool(
+  "get_weather",
+  {
+    title: "Get Weather",
+    description: "Returns current temperature (°C) and a short description for a city.",
+    inputSchema: { city: z.string().describe("City name") }
   },
-  handler: async ({ city }) => {
+  async ({ city }) => {
     // Geocode
     const geo = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(
-        city
-      )}&count=1`
-    ).then((r) => r.json());
+      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1`
+    ).then(r => r.json());
 
-    if (!geo.results?.length) {
+    if (!geo?.results?.length) {
       return { content: [{ type: "text", text: `City not found: ${city}` }] };
     }
     const { latitude, longitude, name } = geo.results[0];
@@ -33,65 +31,31 @@ const getWeather: Tool = {
     // Weather
     const wx = await fetch(
       `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`
-    ).then((r) => r.json());
+    ).then(r => r.json());
 
     const cur = wx.current_weather;
-    const code = Number(cur.weathercode);
-    const mapping: Record<number, string> = {
-      0: "clear",
-      1: "mainly clear",
-      2: "partly cloudy",
-      3: "overcast",
-      45: "fog",
-      48: "rime fog",
-      51: "light drizzle",
-      61: "light rain",
-      63: "rain",
-      65: "heavy rain",
-      71: "snow",
-      80: "rain showers"
-      // (trimmed; add more codes as needed)
-    };
-
-    const desc = mapping[code] ?? `weather code ${code}`;
+    const codes = { 0: "clear", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 61: "light rain", 63: "rain", 65: "heavy rain", 71: "snow", 80: "rain showers" };
+    const desc = codes[Number(cur.weathercode)] ?? `weather code ${cur.weathercode}`;
     const text = `In ${name}, it is ${cur.temperature}°C and ${desc}.`;
 
     return { content: [{ type: "text", text }] };
-  },
-};
-
-// 2) Create the MCP server and register the tool
-const mcp = new McpServer(
-  { name: "weather-mcp", version: "1.0.0" },
-  { tools: { [getWeather.name]: getWeather } }
+  }
 );
 
-// 3) Bind a single Streamable HTTP endpoint (/mcp)
-const httpServer = createServer(async (req, res) => {
-  // Basic CORS for browser-based clients
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, MCP-Protocol-Version, Mcp-Session-Id, Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+// 2) HTTP endpoint for Streamable HTTP
+const app = express();
+app.use(express.json());
 
-  // Only handle the MCP endpoint; everything else 404
-  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-  if (url.pathname !== "/mcp") {
-    res.writeHead(404);
-    res.end("Not Found");
-    return;
-  }
-
-  // Hand off to the MCP Streamable HTTP transport
-  const transport = new StreamableHttpServerTransport("/mcp");
-  await transport.handleRequest(mcp, req, res);
+app.post("/mcp", async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    enableJsonResponse: true // no SSE needed
+  });
+  res.on("close", () => transport.close());
+  await mcp.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
 
-const PORT = 3000;
-httpServer.listen(PORT, () => {
-  console.log(`✅ MCP server listening on :${PORT} at /mcp`);
+const port = 3000;
+app.listen(port, () => {
+  console.log(`✅ Weather MCP running at /mcp on :${port}`);
 });
